@@ -7,7 +7,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { Trash2, Search, Check, Plus, Smartphone, Package } from "lucide-react"
+import { Trash2, Search, Check, Plus, Smartphone, Package, FileText } from "lucide-react"
 import type { Sale } from "@/app/page"
 import { useInventory } from "@/components/inventory-context"
 import { useClients } from "@/components/client-context"
@@ -16,6 +16,7 @@ import { useCash } from "@/components/cash-context"
 import { useAuth } from "@/components/auth-context"
 import { AddClientModal } from "@/components/clients-modal"
 import { useProductCategories } from "@/components/product-categories-context"
+import { toast } from "@/components/ui/use-toast"
 
 const sellers = ["Riki", "Vale"]
 
@@ -39,7 +40,7 @@ type TradeIn = {
 interface NewSaleModalProps {
   isOpen: boolean
   onOpenChange: (isOpen: boolean) => void
-  onSaleAdd: (sale: Omit<Sale, "id" | "date" | "time">) => void
+  onSaleAdd: (sale: Omit<Sale, "id" | "date" | "time">) => Promise<{ sale: Sale } | null>
 }
 
 export function NewSaleModal({ isOpen, onOpenChange, onSaleAdd }: NewSaleModalProps) {
@@ -49,7 +50,9 @@ export function NewSaleModal({ isOpen, onOpenChange, onSaleAdd }: NewSaleModalPr
   const { addTransaction } = useCash()
   const { user } = useAuth()
   const { categories } = useProductCategories()
+
   const availableInventory = getAvailableItems()
+
   const [selectedProducts, setSelectedProducts] = useState<SelectedProduct[]>([])
   const [seller, setSeller] = useState<string>("")
   const [customer, setCustomer] = useState<string>("")
@@ -100,22 +103,21 @@ export function NewSaleModal({ isOpen, onOpenChange, onSaleAdd }: NewSaleModalPr
     return `${year}-${month}-${day}`
   }
 
-  const handleAddSale = () => {
+  const handleAddSale = async () => {
     if (!seller || !customer || selectedProducts.length === 0) {
-      alert("Por favor, complete todos los campos: Vendedor, Cliente y al menos un producto seleccionado.")
+      toast({
+        title: "Error",
+        description: "Por favor, complete todos los campos: Vendedor, Cliente y al menos un producto seleccionado.",
+        variant: "destructive",
+      })
       return
     }
 
     const totalSalePrice = selectedProducts.reduce((sum, item) => sum + item.price, 0)
     const tradeInValue = tradeInDetails?.takenValue || 0
-
     const cashReceived = totalSalePrice - tradeInValue
-
-    const totalIncome = totalSalePrice
-
     const totalProductCost = selectedProducts.reduce((sum, item) => sum + item.cost, 0)
-
-    const grossProfit = totalIncome - totalProductCost
+    const grossProfit = totalSalePrice - totalProductCost
 
     const orderDescription = selectedProducts
       .map((item) => `${item.name} (Precio: $${item.price}, Costo: $${item.cost})`)
@@ -132,62 +134,147 @@ export function NewSaleModal({ isOpen, onOpenChange, onSaleAdd }: NewSaleModalPr
       order: orderDescription,
       tradeIn: tradeInDescription,
       grossProfit,
-      total: totalIncome,
+      total: totalSalePrice,
       discount: 0,
       totalCost: totalProductCost,
     }
 
-    // El valor del canje NO se registra en caja - solo entra al inventario
-    if (paymentType === "cash") {
-      addTransaction({
-        type: "income",
-        date: getCurrentLocalDate(),
-        amount: cashReceived,
-        paymentMethod: "cash",
-        category: "Cobranzas",
-        description: `Venta - ${customer}: ${selectedProducts[0]?.name}${selectedProducts.length > 1 ? ` y ${selectedProducts.length - 1} más` : ""}${tradeInDetails ? ` (con canje -$${tradeInValue})` : ""}`,
-        relatedTo: "sale",
-        relatedId: `sale_${Date.now()}`,
+    try {
+      // Guardar venta
+      const result = await onSaleAdd(newSale)
+
+      if (!result?.sale) {
+        throw new Error("Failed to get sale ID")
+      }
+
+      const savedSaleId = result.sale.id
+
+      await new Promise((resolve) => setTimeout(resolve, 100))
+
+      // Registrar en caja (solo contado)
+      if (paymentType === "cash") {
+        addTransaction({
+          type: "income",
+          date: getCurrentLocalDate(),
+          amount: cashReceived,
+          paymentMethod: "cash",
+          category: "Cobranzas",
+          description: `Venta - ${customer}: ${selectedProducts[0]?.name}${
+            selectedProducts.length > 1 ? ` y ${selectedProducts.length - 1} más` : ""
+          }${tradeInDetails ? ` (con canje -$${tradeInValue})` : ""}`,
+          relatedTo: "sale",
+          relatedId: savedSaleId,
+        })
+      }
+
+      // Registrar crédito
+      if (paymentType === "credit") {
+        const clientData = searchClients(customer).find((c) => c.name === customer)
+        const clientId = clientData?.id || `temp_${Date.now()}`
+
+        await addSaleToAccount(
+          clientId,
+          customer,
+          savedSaleId,
+          cashReceived,
+          `Venta: ${orderDescription.split("\n")[0]}...`,
+        )
+      }
+
+      // Marcar productos como vendidos
+      markItemsAsSold(selectedProducts.map((item) => item.id))
+
+      // Ingresar canje al inventario
+      if (tradeInDetails) {
+        addInventoryItem({
+          model: tradeInDetails.model,
+          storage: tradeInDetails.gb + "GB",
+          color: tradeInDetails.color,
+          battery: Number.parseInt(tradeInDetails.battery),
+          imei: tradeInDetails.imei,
+          costPrice: tradeInDetails.takenValue,
+          salePrice: tradeInDetails.resaleValue,
+          condition: "Usado",
+          provider: "Plan Canje",
+          status: "Disponible",
+          productType: "Celular",
+        })
+      }
+
+      // --- Cerrar modal ---
+      resetModal()
+      onOpenChange(false)
+    } catch (error) {
+      console.error("[v0] Error saving sale:", error)
+      toast({
+        title: "Error",
+        description: "Error al guardar la venta. Por favor, intente nuevamente.",
+        variant: "destructive",
       })
+      return
     }
+  }
 
-    if (paymentType === "credit") {
-      const clientData = searchClients(customer).find((c) => c.name === customer)
-      const clientId = clientData?.id || `temp_${Date.now()}`
-
-      addSaleToAccount(
-        clientId,
-        customer,
-        `sale_${Date.now()}`,
-        cashReceived,
-        `Venta: ${orderDescription.split("\n")[0]}...`,
-        undefined,
-      )
-    }
-
-    // Mark products as sold
-    const soldItemIds = selectedProducts.map((item) => item.id)
-    markItemsAsSold(soldItemIds)
-
-    // Esto es capital que entra al stock, NO es un ingreso de caja
-    if (tradeInDetails) {
-      addInventoryItem({
-        model: tradeInDetails.model,
-        storage: tradeInDetails.gb + "GB",
-        color: tradeInDetails.color,
-        battery: Number.parseInt(tradeInDetails.battery),
-        imei: tradeInDetails.imei,
-        costPrice: tradeInDetails.takenValue,
-        salePrice: tradeInDetails.resaleValue,
-        condition: "Usado",
-        provider: "Plan Canje",
-        status: "Disponible",
-        productType: "Celular",
+  const handleGenerateInvoice = () => {
+    if (selectedProducts.length === 0) {
+      toast({
+        title: "Error",
+        description: "No hay productos seleccionados",
+        variant: "destructive",
       })
+      return
     }
 
-    onSaleAdd(newSale)
-    resetModal()
+    const saleId = `order_${Date.now()}`
+    const currentDate = new Date().toLocaleDateString("es-AR")
+
+    const invoiceData = {
+      saleId,
+      date: currentDate,
+      client: customer || "Cliente",
+      vendor: seller,
+      paymentType: paymentType === "cash" ? "Contado" : "A Crédito",
+      products: selectedProducts.map((product, index) => ({
+        number: index + 1,
+        description: product.name,
+        quantity: 1,
+        price: product.price,
+        total: product.price,
+      })),
+      canjeProducts: tradeInDetails
+        ? [
+            {
+              description: `${tradeInDetails.model} - ${tradeInDetails.gb}GB - ${tradeInDetails.color}`,
+              quantity: 1,
+              price: -tradeInDetails.takenValue,
+              total: -tradeInDetails.takenValue,
+            },
+          ]
+        : [],
+      subtotal: selectedProducts.reduce((sum, item) => sum + item.price, 0),
+      discount: 0,
+      total: selectedProducts.reduce((sum, item) => sum + item.price, 0) - (tradeInDetails?.takenValue || 0),
+    }
+
+    const htmlContent = generateInvoiceHTML(invoiceData)
+
+    // Create a Blob from the HTML content
+    const blob = new Blob([htmlContent], { type: "text/html" })
+    const url = URL.createObjectURL(blob)
+
+    // Create a temporary link and click it
+    const link = document.createElement("a")
+    link.href = url
+    link.target = "_blank"
+    link.rel = "noopener noreferrer"
+    document.body.appendChild(link)
+    link.click()
+
+    // Clean up
+    setTimeout(() => {
+      document.body.removeChild(link)
+      URL.revokeObjectURL(url)
+    }, 100)
   }
 
   const resetModal = () => {
@@ -259,6 +346,224 @@ export function NewSaleModal({ isOpen, onOpenChange, onSaleAdd }: NewSaleModalPr
 
   const isProductSelected = (productId: string) => {
     return selectedProducts.some((p) => p.id === productId)
+  }
+
+  const generateInvoiceHTML = (data: any) => {
+    // Logo en base64 (iPro logo)
+    const logoBase64 =
+      "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAASwAAAEsCAYAAAB5fY51AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAABmGSURBVHgB7Z0HeBRV28fPbDYJCSWhhN57R6ooTUBARQEBBUFRUUGxvNgQe0EFFRUFBQu+IiKKCFJEQECkSBOQXqUESAglhSQkm93Z7/ufdSFkZ3dnZ3dntnx/zzMPsJnZM2fO/Oe0/zkXAEEQBAGMZJ8TBEEQwCCwCIIgzAIFFkEQhFlgsAjCX8jKycmxszCZ7BKAIAiCAAaB5YMg/AXLjOy8/LwDB7w+vgIQBEEQwCCwCIIgzAIFFkEQhFlgsAjCX9i3YdeDLMzmaIAnTLgjO/9Y4YNRj34BEARBEMAgsBCCIAizQGARBEGYBQaLICqI/DMXbuakpl4ECIIgCGAQWAhBEIRZoMAiCIIwCwwWQfgLVU6drquyZMksgCAIggAGgYUQBEGYBQaLIAjCLDBYBOEvVN+0aQILs+/FXwEEQRAEMAgsgiAIs8BgEQRBmAUGiyD8BYXC8SYLs+/FPgAEQRAEMAgsgiAIs8BgEQRBmAUGiyD8hcqrV7/Nwuw78ReAIAiCAAaBRRAEYRYYLIIgCLPAYBGEv2CFMd+yMPte7AEQBEEQwCCwEIIgCLNAgUUQBGEWGCyC8BdUhw//zsLsB/B3gCAIggAGgYUQBEGYBQaLIAjCLDBYBOEvtNu//yMWZr8L/w8gCIIggEFgIQRBEGaBwSIIgvAbHg8WQfgLXU6frsFijXcL7wcIgiAIYBBYCEEQhFlgsAiCIMwCg0UQfsKubYdGskyVhoD7AYIgCAIYBBZCEARhFhgsgiAIs8BgEYSfUKN5s7ssU3UIIAiCIIBBYCEEQRBmgcEiCIIwCwwWQfgJXXVuTvGnL4y/ASAIgiCAQWAhBEEQZoHBIgiCMAssFT1BECbR/58DDzCJ6kdUVgIEQZhE/lmU++fvgCAIgjCJCx+87/bAorJ+eXj7kVv7AIIgCMJg8r+a5fbfZnvY7rNu7cGMY+ceAAiCIAhDcdWt6/axrbKHc48fv+8NgCAIgjAMPd26ugUWLctU7zO1N0AQBEEYhuYundz+m6Ku2Y3Cxye5vcTZTtvSUuN7d+wEqNwfQdgH/h5YN84f2Jw0qn0LgCAIH1Fs4dRSK7kGjg6su/kXDgzP6dmhH0AQhA/IN3TyPfg+smQZoTJ0sroHlgzCJQbM7PxB3PoJIye+v37yF4AgCB+x9uU3f5cFVe+RI8e8Ag1GIxPRuEp/AAiC8AKB+Pf5c1cUrvx0Ps0YT9v22T/5a3buWtvkgSGTAYIgfEDRrh3Zsu8XP/xo+PBevU69/+7Ug8HW1gADSwsxvN0bY+9rP+Tut94BCIKwMIc++/zf/gf+u/TzMev+eueD+EANLIAgCAI3h8UBBEFYmJP//LMcf/+fRx9d1P35sR0B72BgEQRB+IiMo0dOVp8xPeX6N/O+aTp23P04a3M9YC1ggCAIf+GKg0JVLg7IggXWJ/FvGvplGh/Oe+XVBDwHe+rF3gRB+Iu8b7+NdnYsq8Cbf/63/5ULFy5/+/KEC3hzO1oQWDZo/6mU2u+VPp/dTqsWHZaV7z5Y/HLGfwdqVatW78y5c6e6tu8grXnlre+PqwSY1r6NbhUbgi/g/z8zJ/JOXWhOVT7L+JQPw8F4FwMsVn7Y+vZW/L/x91Xdv/8Pf/+fIg4vUJtR93x+rWJVqJ/Ypk0bbpH95b93f/XNN01fffZ5wDZCGywC0OFfjxWKMPfT27YttNjc5Ij//5z2/8dJF8Ty9yRnvj..."
+    return `
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <meta charset="UTF-8">
+          <title>Orden de venta - ${data.saleId}</title>
+          <style>
+            * {
+              margin: 0;
+              padding: 0;
+              box-sizing: border-box;
+            }
+            body {
+              font-family: Arial, sans-serif;
+              padding: 40px;
+              background: white;
+            }
+            .header {
+              display: flex;
+              justify-content: space-between;
+              align-items: flex-start;
+              margin-bottom: 30px;
+            }
+            .header-left h1 {
+              font-size: 28px;
+              font-weight: bold;
+              margin-bottom: 5px;
+            }
+            .header-left .order-id {
+              font-size: 24px;
+              font-weight: bold;
+              margin-bottom: 20px;
+            }
+            .header-left .info {
+              font-size: 14px;
+              line-height: 1.8;
+            }
+            .header-right {
+              text-align: right;
+            }
+            .logo {
+              width: 150px;
+              height: auto;
+              margin-bottom: 15px;
+            }
+            .social-info {
+              font-size: 12px;
+              line-height: 1.8;
+              display: flex;
+              flex-direction: column;
+              gap: 5px;
+            }
+            .social-item {
+              display: flex;
+              align-items: center;
+              gap: 8px;
+              justify-content: flex-end;
+            }
+            table {
+              width: 100%;
+              border-collapse: collapse;
+              margin: 20px 0;
+            }
+            thead {
+              background-color: #90EE90;
+            }
+            th {
+              padding: 12px;
+              text-align: left;
+              font-weight: bold;
+              border: 1px solid #ddd;
+            }
+            td {
+              padding: 10px 12px;
+              border: 1px solid #ddd;
+            }
+            tbody tr:hover {
+              background-color: #f5f5f5;
+            }
+            .summary {
+              margin-top: 30px;
+              padding: 20px 0;
+              border-top: 2px solid #333;
+            }
+            .summary-row {
+              display: flex;
+              justify-content: space-between;
+              margin: 8px 0;
+              font-size: 14px;
+            }
+            .summary-row.total {
+              background-color: #90EE90;
+              padding: 10px;
+              font-weight: bold;
+              font-size: 16px;
+              margin-top: 10px;
+            }
+            .footer {
+              margin-top: 30px;
+              font-size: 12px;
+              color: #666;
+            }
+            @media print {
+              body {
+                padding: 20px;
+              }
+            }
+          </style>
+        </head>
+        <body>
+          <div class="header">
+            <div class="header-left">
+              <h1>Orden de venta</h1>
+              <div class="order-id">${data.saleId}</div>
+              <div class="info">
+                <div><strong>Fecha:</strong> ${data.date}</div>
+                <div><strong>Cliente:</strong> ${data.client}</div>
+                <div><strong>Tel:</strong></div>
+              </div>
+            </div>
+            <div class="header-right">
+              <!-- Using base64 encoded logo to ensure it displays in about:blank window -->
+              <img src="${logoBase64}" alt="iPro" class="logo" />
+              <div class="social-info">
+                <div class="social-item">
+                  <span>📞</span>
+                  <span>2657-543062</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <table>
+            <thead>
+              <tr>
+                <th>N°</th>
+                <th>Descripción</th>
+                <th>Cantidad</th>
+                <th>Precio</th>
+                <th>Total</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${data.products
+                .map(
+                  (product: any) => `
+                <tr>
+                  <td>${product.number}</td>
+                  <td>${product.description}</td>
+                  <td>${product.quantity}</td>
+                  <td>$ ${product.price.toLocaleString("es-AR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                  <td>$ ${product.total.toLocaleString("es-AR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                </tr>
+              `,
+                )
+                .join("")}
+              ${data.canjeProducts
+                .map(
+                  (product: any) => `
+                <tr>
+                  <td>-</td>
+                  <td>${product.description} (Canje)</td>
+                  <td>${product.quantity}</td>
+                  <td>$ ${product.price.toLocaleString("es-AR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                  <td>$ ${product.total.toLocaleString("es-AR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                </tr>
+              `,
+                )
+                .join("")}
+            </tbody>
+          </table>
+
+          <div class="summary">
+            <div class="summary-row">
+              <span>Total cant. ${data.products.length + data.canjeProducts.length}</span>
+              <span></span>
+            </div>
+            <div class="summary-row">
+              <span>SubTotal</span>
+              <span>$ ${data.subtotal.toLocaleString("es-AR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+            </div>
+            <div class="summary-row">
+              <span>Descuento</span>
+              <span>${data.discount}%</span>
+            </div>
+            <div class="summary-row total">
+              <span>Total a pagar</span>
+              <span>$ ${data.total.toLocaleString("es-AR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+            </div>
+            <div class="summary-row">
+              <span>Abona ${data.paymentType}</span>
+              <span>$ ${data.total.toLocaleString("es-AR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+            </div>
+            ${
+              data.paymentType === "A Crédito"
+                ? `
+            <div class="summary-row">
+              <span>Abona contra entrega</span>
+              <span>$ ${data.total.toLocaleString("es-AR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+            </div>
+            `
+                : ""
+            }
+          </div>
+
+          <div class="footer">
+            <p><strong>iPro</strong> - Tel: 2657-543062</p>
+          </div>
+          
+        </body>
+      </html>
+    `
   }
 
   return (
@@ -614,7 +919,19 @@ export function NewSaleModal({ isOpen, onOpenChange, onSaleAdd }: NewSaleModalPr
 
               {/* Total */}
               <div className="mb-4 md:mb-6">
-                <div className="text-xl md:text-2xl font-bold">Total a recibir: ${finalTotal}</div>
+                <div className="flex items-center gap-3">
+                  <div className="text-xl md:text-2xl font-bold">Total a recibir: ${finalTotal}</div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="icon"
+                    onClick={handleGenerateInvoice}
+                    disabled={selectedProducts.length === 0}
+                    title="Generar factura"
+                  >
+                    <FileText className="h-4 w-4" />
+                  </Button>
+                </div>
                 {selectedProducts.length > 0 && (
                   <div className="text-xs md:text-sm text-gray-600 mt-1">
                     Precio venta: ${totalCart} {tradeInDetails && `- Canje (capital): $${tradeInDetails.takenValue}`}
